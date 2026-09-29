@@ -560,9 +560,12 @@ add_library(luce_common STATIC
     src/gemma4/gemma4_daemon.cpp
     src/gemma4/gemma4_dflash_target.cpp
     src/gemma4/gemma4_layer_split_adapter.cpp
-    # DeepSeek V4 Flash target arch
+    # DeepSeek V4 Flash target arch (and V4.1 Flash)
     src/deepseek4/deepseek4_loader.cpp
     src/deepseek4/deepseek4_graph.cpp
+    src/deepseek4/deepseek4_candidates.cpp
+    src/deepseek4/deepseek4_engram.cpp
+    src/deepseek4/deepseek4_engram_apply.cpp
     src/deepseek4/deepseek4_snapshot.cpp
     src/deepseek4/deepseek4_roctx.cpp
     src/deepseek4/deepseek4_paged_cache.cpp
@@ -629,6 +632,8 @@ add_library(luce_common STATIC
     src/common/moe_hybrid_storage.cpp
     src/common/spark_corpus.cpp
     src/common/moe_hybrid_ffn_eval.cpp
+    src/common/moe_hybrid_expert_cache.cpp
+    src/common/platform_io.cpp
     src/common/moe_hybrid_stream.cpp
     src/common/moe_expert_compute.cpp
     src/common/moe_expert_compute_cpu.cpp
@@ -1403,6 +1408,15 @@ if(LUCE_TESTS)
             ENVIRONMENT "GGML_CUDA_DISABLE_COPY_BATCH=1")
     endif()
     if(LUCE_GPU_BACKEND STREQUAL "hip")
+        add_executable(test_ggml_host_mailbox_cuda test/test_ggml_host_mailbox_cuda.cpp)
+        set_source_files_properties(test/test_ggml_host_mailbox_cuda.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(test_ggml_host_mailbox_cuda PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
+        target_include_directories(test_ggml_host_mailbox_cuda PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(test_ggml_host_mailbox_cuda PRIVATE
+            ggml ${LUCE_GGML_BACKEND_TARGET} hip::host)
+    endif()
+    if(LUCE_GPU_BACKEND STREQUAL "hip")
         add_executable(test_ds4_maskless_prefill test/test_ds4_maskless_prefill.cpp)
         set_source_files_properties(test/test_ds4_maskless_prefill.cpp PROPERTIES LANGUAGE HIP)
         set_target_properties(test_ds4_maskless_prefill PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
@@ -1850,6 +1864,18 @@ if(LUCE_TESTS)
         target_include_directories(test_paged_kv_pool PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         list(APPEND _raw_unit_test_targets test_paged_kv_pool)
+    endif()
+    if(UNIX AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_engram.cpp")
+        # DeepSeek V4.1 Engram addressing and row decode: host only, no ggml or
+        # GPU. The fixture writes its tables with POSIX file calls.
+        add_executable(test_ds4_engram
+            test/test_ds4_engram.cpp
+            src/deepseek4/deepseek4_engram.cpp
+            src/common/platform_io.cpp)
+        target_include_directories(test_ds4_engram PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        find_package(Threads REQUIRED)
+        target_link_libraries(test_ds4_engram PRIVATE Threads::Threads)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_seq_slot_manager.cpp")
         # Host-side slot bookkeeping test (concurrent serving): no GPU.
@@ -2385,6 +2411,8 @@ if(LUCE_TESTS)
         test_rms_norm_hip
         test_rope_tail
         test_paged_kv_pool
+        test_ds4_engram
+        test_ggml_host_mailbox_cuda
         test_rocmfp3_mix_registry
         test_rocmfp_mix_slice_matvec
         test_rocmfp_mix_gateup_glu
@@ -2790,6 +2818,15 @@ if(LUCE_SERVER)
                 COMMENT "Copying status.html to build/share/"
             )
             install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/share/status.html"
+                    DESTINATION share)
+            # The ds41-lucebox profile's data files, found next to the binary
+            # (build/share, <prefix>/share) like status.html.
+            add_custom_command(TARGET luce_server POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    "${CMAKE_CURRENT_SOURCE_DIR}/share/deepseek41"
+                    "$<TARGET_FILE_DIR:luce_server>/share/deepseek41"
+                COMMENT "Copying share/deepseek41 to build/share/")
+            install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/share/deepseek41"
                     DESTINATION share)
         endif()
     endif()

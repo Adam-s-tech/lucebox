@@ -138,6 +138,15 @@ GGML_BACKEND_API int ggml_backend_cuda_get_device_id(ggml_backend_t backend);
 // changing concurrent requests or other CUDA/HIP backends.
 GGML_BACKEND_API int ggml_backend_cuda_set_mmvq_max_ncols_override(int max_ncols);
 
+// Calling-thread switch for batch-invariant quantized MUL_MAT: while set,
+// products of up to eight columns stay on the matrix-vector path with the
+// single-column block shape (Q8_0 reads each weight row once for all
+// columns, other types run the single-column kernel per column), so each
+// output column is bit-identical to the same product of that column alone
+// and a speculative verifier reproduces single-token decode exactly.
+// Returns the previous setting.
+GGML_BACKEND_API bool ggml_backend_cuda_set_mmvq_batch_invariant(bool enabled);
+
 // Calling-thread DS4 mixed-expert dispatch ceiling, scoped to a graph compute.
 // Accepts 0 (the default of five) or 1..16; returns the previous ceiling.
 GGML_BACKEND_API int ggml_backend_cuda_set_ds4_mix_mmv_max_tokens_override(int max_tokens);
@@ -227,6 +236,15 @@ GGML_BACKEND_API bool ggml_cuda_rocmfp2_mix_register_host(
         const void * codebooks_bf16_host, const uint8_t * modes_host);
 GGML_BACKEND_API void ggml_cuda_rocmfp2_mix_unregister(const void * base);
 GGML_BACKEND_API void ggml_cuda_rocmfp3_mix_unregister(const void * base);
+
+// Integrated GPUs only. While on, a buffer allocation on `device` that would
+// leave less than `carve_reserve` bytes free in the carve goes to locked host
+// memory instead, up to `host_bytes` in total; the GPU reads it from the same
+// DRAM. Returns the host bytes granted (capped by RLIMIT_MEMLOCK), 0 when off.
+// Pass 0 to turn it off; buffers already placed stay where they are.
+GGML_BACKEND_API size_t ggml_backend_cuda_set_host_spill(int device, size_t carve_reserve, size_t host_bytes);
+// Bytes of live `device` buffers in locked host memory.
+GGML_BACKEND_API size_t ggml_backend_cuda_host_spill_bytes(int device);
 
 #ifdef  __cplusplus
 }
