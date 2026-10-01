@@ -40,6 +40,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <functional>
+#include <memory>
+#include <utility>
 #include <vector>
 
 namespace luce::common {
@@ -137,11 +140,17 @@ public:
         return true;
     }
 
+    // Hands the verify logits over instead of copying them (q rows of the
+    // full vocabulary per sampled step): one read per verify, and the next
+    // verify rebuilds the buffer. A second read fails rather than return a
+    // stale step.
     bool read_verify_logits(int n_tokens, std::vector<float> & out) override {
         if (!keep_logits_ || verify_logits_.empty()) return false;
         const size_t need = (size_t) n_tokens * w_.n_vocab;
         if (verify_logits_.size() < need) return false;
-        out.assign(verify_logits_.begin(), verify_logits_.begin() + need);
+        out.swap(verify_logits_);
+        out.resize(need);
+        verify_logits_.clear();
         return true;
     }
 
@@ -926,7 +935,8 @@ bool run_deepseek4_dspark_spec_decode(
         const std::function<bool(int32_t)> & on_token,
         MoeHybridStorage * moe_hybrid,
         MoeExpertComputeRuntime * expert_runtime,
-        MoeHybridRoutingStats * routing_stats) {
+        MoeHybridRoutingStats * routing_stats,
+        DSparkSpecSampling * sampling) {
     const int n_embd = target_w.n_embd;
     const int n_tgt = drafter.n_target_layers;
     const int block = drafter.block_size;
@@ -1121,6 +1131,12 @@ bool run_deepseek4_dspark_spec_decode(
     // Cumulative phase timings (ms).
     double tm_draft = 0, tm_head = 0, tm_save = 0, tm_verify = 0, tm_apply = 0, tm_feat = 0;
     double tm_probe_submit = 0, tm_probe_wait = 0;
+    double tm_sample = 0;
+    std::vector<float> spec_logits;
+    std::vector<std::vector<std::pair<float, int>>> spec_rows;
+    std::vector<std::vector<int32_t>> spec_hist;   // per-row sampler history
+    std::unique_ptr<DSparkRowPool> row_pool;       // created on the first sampled step
+    if (sampling) target.set_keep_logits(true);   // verify returns every row's logits
     const SpecClock::time_point run_t0 = SpecClock::now();
 
     while (n_generated < n_gen) {
@@ -1337,7 +1353,8 @@ bool run_deepseek4_dspark_spec_decode(
             deepseek4_dspark_draft_wait(drafter_backend);
             tm_probe_wait += spec_ms_since(probe_t0);
         }
-        if (!verify_ok) {
+        // Drop the whole verified batch from the cache (restore to pos).
+        const auto undo_verify = [&] {
             if (full_snap) {
                 if (!target.restore_kv()) {
                     std::fprintf(stderr, "[ds4-spec] restore after verify failure failed\n");
@@ -1346,6 +1363,9 @@ bool run_deepseek4_dspark_spec_decode(
                 spec_rollback_apply(
                     rollback, target_w, target_cache, pos, boundary_crossed);
             }
+        };
+        if (!verify_ok) {
+            undo_verify();
             std::fprintf(stderr, "[ds4-spec] verify failed\n");
             ok = false;
             break;
@@ -1354,12 +1374,44 @@ bool run_deepseek4_dspark_spec_decode(
         // Accept the longest matching prefix. accept counts the seed (slot 0)
         // plus each candidate the target agrees with.
         int accept = 1;
-        for (int i = 0; i < q - 1; i++) {
-            if (draft_tok[i + 1] == tgt_am[i]) accept++;
-            else break;
+        int bonus = -1;
+        if (sampling) {
+            // Verify row i is the target's next-token logits after
+            // draft_tok[i]. Each row's distribution depends only on its logits
+            // and on the history extended by draft_tok[1..i], all known now,
+            // so the rows are built concurrently (serially this was 4-6 ms per
+            // q5 step on the host); the walk consumes them in order.
+            t0 = SpecClock::now();
+            if (!target.read_verify_logits(q, spec_logits)) {
+                undo_verify();
+                std::fprintf(stderr, "[ds4-spec] sampling: verify logits unavailable\n");
+                ok = false;
+                break;
+            }
+            if (spec_rows.size() < (size_t) q) spec_rows.resize((size_t) q);
+            if (spec_hist.size() < (size_t) q) spec_hist.resize((size_t) q);
+            const std::function<void(int)> build_row = [&](int i) {
+                dspark_row_history(sampling->cfg, sampling->history, draft_tok.data(), i,
+                                   spec_hist[(size_t) i]);
+                sampler_distribution(spec_logits.data() + (size_t) i * target_w.n_vocab,
+                                     target_w.n_vocab, sampling->cfg, spec_hist[(size_t) i],
+                                     spec_rows[(size_t) i]);
+            };
+            if (!row_pool) row_pool = std::make_unique<DSparkRowPool>(std::max(0, q_cap - 1));
+            row_pool->run(q, build_row);
+            const DSparkSampleStep step =
+                dspark_spec_sample_accept(spec_rows, draft_tok.data(), q, *sampling->rng);
+            accept = step.accept;
+            bonus = step.bonus;
+            tm_sample += spec_ms_since(t0);
+        } else {
+            for (int i = 0; i < q - 1; i++) {
+                if (draft_tok[i + 1] == tgt_am[i]) accept++;
+                else break;
+            }
+            bonus = tgt_am[accept - 1];                       // target's token at the accept point
         }
         const int matched = accept - 1;                       // accepted candidates
-        const int bonus = tgt_am[accept - 1];                 // target's token at the accept point
         const int commit_pos = pos + accept;                  // seed + accepted candidates in KV
 
         if (timing && steps < 8 && q >= 2) {
@@ -1493,6 +1545,7 @@ bool run_deepseek4_dspark_spec_decode(
                              i == accept ? " bonus" : "");
             }
             out_tokens.push_back(t);
+            if (sampling) sampling->history.push_back(t);
             n_generated++;
             if (on_token && !on_token(t)) {
                 stop_requested = true;
@@ -1527,11 +1580,12 @@ bool run_deepseek4_dspark_spec_decode(
     }
     std::fprintf(stderr,
                  "[ds4-spec] gen=%d steps=%ld mean_accept=%.2f/%.2f "
-                 "q_cap=%d full_snap=%d\n",
+                 "q_cap=%d full_snap=%d sampling=%d sample=%.2f ms/step\n",
                  n_generated, steps,
                  steps ? (double) accept_sum / steps : 0.0,
                  steps ? (double) offered_sum / steps : 0.0, q_cap,
-                 (int) full_snap);
+                 (int) full_snap, sampling ? 1 : 0,
+                 steps ? tm_sample / steps : 0.0);
     if (width_controller.enabled()) {
         std::fprintf(
             stderr,
