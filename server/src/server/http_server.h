@@ -105,11 +105,14 @@ struct ServerConfig {
     // kPrefixCacheBudgetAuto sizes it from the backend's snapshot size at
     // its full context; zero means unlimited.
     static constexpr size_t kPrefixCacheBudgetAuto = (size_t)-1;
+    static constexpr size_t kConcurrentPrefixBudgetFloor = (size_t)4 * 1024 * 1024 * 1024;
     size_t      prefix_cache_max_bytes = kPrefixCacheBudgetAuto;
     // Resident system-memory budget for copied paged checkpoints. The
     // scheduler enforces it only when concurrent paged prefix storage is
-    // active. Zero means unlimited.
-    size_t      concurrent_prefix_cache_max_bytes = (size_t)4 * 1024 * 1024 * 1024;
+    // active. kPrefixCacheBudgetAuto sizes it when the scheduler starts, from
+    // the slot count and the batch engine's checkpoint size at --max-ctx
+    // (at least kConcurrentPrefixBudgetFloor); zero means unlimited.
+    size_t      concurrent_prefix_cache_max_bytes = kPrefixCacheBudgetAuto;
     bool        concurrent_paged_prefix_cache = false;
     int         prefill_cache_cap = 0;  // full-prompt/prefill cache slots (0 disables)
     // Extend the existing prefix cache through generated tool-call turns.
@@ -372,6 +375,10 @@ struct PrefixCacheBudget {
     std::string error;        // set when an explicit limit cannot apply;
                               // startup rejects that configuration
 };
+// Automatic concurrent paged prefix budget: 2 x slots + 1 checkpoints of
+// per_checkpoint bytes, at least ServerConfig::kConcurrentPrefixBudgetFloor
+// and, above that, at most memory / 4 when memory is known (non-zero).
+size_t auto_concurrent_prefix_budget(size_t per_checkpoint, int slots, size_t memory);
 PrefixCacheBudget resolve_prefix_cache_budget(const ServerConfig & config,
                                               const ModelBackend & backend);
 
@@ -549,6 +556,8 @@ private:
     // drains its pending prefill between decode iterations, then advances
     // active slots together in one batched step.
     void scheduler_loop(SeqEngine & engine);
+    // Automatic concurrent prefix budget for `slots` checkpoints of `per_checkpoint` bytes.
+    size_t concurrent_prefix_budget(size_t per_checkpoint, int slots) const;
 
     // Non-blocking dequeue used for admission polling between decode steps.
     ServerJob * try_dequeue();

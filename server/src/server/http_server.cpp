@@ -1321,13 +1321,34 @@ static size_t budgetable_memory_bytes() {
     return 0;
 }
 
+size_t auto_concurrent_prefix_budget(size_t per_checkpoint, int slots, size_t memory) {
+    // Each decode slot keeps its conversation's restore point and the capture
+    // in flight, plus one shared system/tools head: 2 x slots + 1 checkpoints
+    // at --max-ctx. Never less than the former fixed 4096 MiB; above that,
+    // never more than a quarter of the memory available (when known).
+    const size_t floor = ServerConfig::kConcurrentPrefixBudgetFloor;
+    size_t bytes = std::max(floor, per_checkpoint * (2 * (size_t)std::max(1, slots) + 1));
+    if (memory > 0) bytes = std::min(bytes, std::max(floor, memory / 4));
+    return bytes;
+}
+
+size_t HttpServer::concurrent_prefix_budget(size_t per_checkpoint, int slots) const {
+    return auto_concurrent_prefix_budget(per_checkpoint, slots, budgetable_memory_bytes());
+}
+
 PrefixCacheBudget resolve_prefix_cache_budget(const ServerConfig & config,
                                               const ModelBackend & backend) {
     PrefixCacheBudget out;
     // No prefix cache, nothing to bound (e.g. single-sequence paged serving).
     if (config.prefix_cache_cap <= 0) return out;
     if (config.concurrent_paged_prefix_cache) {
-        out.bytes = config.concurrent_prefix_cache_max_bytes;
+        out.automatic = config.concurrent_prefix_cache_max_bytes ==
+            ServerConfig::kPrefixCacheBudgetAuto;
+        // Auto starts at the old 4 GiB default; the scheduler resizes it once
+        // the batch engine, which owns paged checkpoints, can size one
+        // (concurrent_prefix_budget below).
+        out.bytes = out.automatic ? ServerConfig::kConcurrentPrefixBudgetFloor
+                                  : config.concurrent_prefix_cache_max_bytes;
         return out;
     }
     out.automatic =
