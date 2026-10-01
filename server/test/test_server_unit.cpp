@@ -3229,6 +3229,140 @@ TEST_CASE(ServerUnitFixture, test_prefix_cache_records_only_validated_restore) {
     unlink(path.c_str());
 }
 
+TEST_CASE(ServerUnitFixture, test_prefix_cache_long_first_turn_snapshots_whole_prompt) {
+    // reserve_inline_snap reads these once per process; the expectations
+    // below are for the defaults, so an exported override skips the case.
+    if (std::getenv("LUCE_PC_DEEP_FIRST_MIN") || std::getenv("LUCE_PC_DEEP_FIRST_MAX_HEAD")) {
+        std::fprintf(stderr, "skip: LUCE_PC_DEEP_FIRST_* overridden\n");
+        return;
+    }
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    // An agent's first turn: a short system/tools head, then a user turn
+    // well past LUCE_PC_DEEP_FIRST_MIN (4096). The snapshot covers the whole
+    // prompt, so the first follow-up does not re-prefill the conversation.
+    std::vector<int32_t> short_head = {1, 100, 3};
+    short_head.insert(short_head.end(), 5000, 101);
+    short_head.push_back(4);
+    {
+        PrefixCache cache(2, tokenizer);
+        auto r = cache.reserve_inline_snap(
+            short_head, /*restored_prefix_len=*/0,
+            /*prefer_tools_boundary=*/true);
+        TEST_ASSERT(r.active());
+        TEST_ASSERT(r.target_cut() == (int) short_head.size());
+        r.cancel();
+    }
+    // A new conversation that restored only the shared head still snapshots
+    // its long first turn whole.
+    {
+        PrefixCache cache(2, tokenizer);
+        auto r = cache.reserve_inline_snap(
+            short_head, /*restored_prefix_len=*/3,
+            /*prefer_tools_boundary=*/true);
+        TEST_ASSERT(r.active());
+        TEST_ASSERT(r.target_cut() == (int) short_head.size());
+        r.cancel();
+    }
+
+    // A head longer than LUCE_PC_DEEP_FIRST_MAX_HEAD (2048) keeps its own
+    // pin: new conversations that share it must not re-prefill it.
+    std::vector<int32_t> long_head = {1};
+    long_head.insert(long_head.end(), 3000, 100);
+    long_head.push_back(3);
+    long_head.insert(long_head.end(), 5000, 101);
+    long_head.push_back(4);
+    {
+        PrefixCache cache(2, tokenizer);
+        auto r = cache.reserve_inline_snap(
+            long_head, /*restored_prefix_len=*/0,
+            /*prefer_tools_boundary=*/true);
+        TEST_ASSERT(r.active());
+        TEST_ASSERT(r.target_cut() == 3002);
+        r.cancel();
+    }
+
+    // A short tail keeps the head pin as before.
+    const std::vector<int32_t> short_tail = {1, 100, 3, 101, 4};
+    {
+        PrefixCache cache(2, tokenizer);
+        auto r = cache.reserve_inline_snap(
+            short_tail, /*restored_prefix_len=*/0,
+            /*prefer_tools_boundary=*/true);
+        TEST_ASSERT(r.active());
+        TEST_ASSERT(r.target_cut() == 3);
+        r.cancel();
+    }
+
+    // A request without tools never pinned the head; it keeps its usual cut
+    // (the start of the last message) rather than a whole-prompt snapshot.
+    {
+        PrefixCache cache(2, tokenizer);
+        auto r = cache.reserve_inline_snap(
+            short_head, /*restored_prefix_len=*/0,
+            /*prefer_tools_boundary=*/false);
+        TEST_ASSERT(r.active());
+        TEST_ASSERT(r.target_cut() == 3);
+        r.cancel();
+    }
+
+    // A forced pin ahead of the restored prefix (PPP's pin of a head seen
+    // before, not resident now) still wins.
+    {
+        PrefixCache cache(2, tokenizer);
+        auto r = cache.reserve_inline_snap(
+            short_head, /*restored_prefix_len=*/0,
+            /*prefer_tools_boundary=*/true, /*forced_cut=*/3);
+        TEST_ASSERT(r.active());
+        TEST_ASSERT(r.target_cut() == 3);
+        r.cancel();
+    }
+    // Once that pin is restored, the long first turn is snapshotted whole.
+    {
+        PrefixCache cache(2, tokenizer);
+        auto r = cache.reserve_inline_snap(
+            short_head, /*restored_prefix_len=*/3,
+            /*prefer_tools_boundary=*/true, /*forced_cut=*/3);
+        TEST_ASSERT(r.active());
+        TEST_ASSERT(r.target_cut() == (int) short_head.size());
+        r.cancel();
+    }
+
+    // The whole-prompt snapshot is what the first follow-up restores: once
+    // committed, the next turn (the first one plus new tokens) finds all of it.
+    {
+        PrefixCache cache(2, tokenizer);
+        auto r = cache.reserve_inline_snap(
+            short_head, /*restored_prefix_len=*/0,
+            /*prefer_tools_boundary=*/true);
+        TEST_ASSERT(r.active());
+        TEST_ASSERT(r.commit(short_head));
+        std::vector<int32_t> follow_up = short_head;
+        follow_up.insert(follow_up.end(), {1, 102, 3, 103, 103, 4});
+        const auto hit = cache.lookup(follow_up);
+        TEST_ASSERT(hit.first >= 0);
+        TEST_ASSERT(hit.second == (int) short_head.size());
+    }
+
+    // A whole prompt the resident budget can never hold keeps the head pin
+    // instead of saving nothing.
+    {
+        PrefixCache cache(2, tokenizer, /*max_resident_bytes=*/1000);
+        auto r = cache.reserve_inline_snap(
+            short_head, /*restored_prefix_len=*/0,
+            /*prefer_tools_boundary=*/true, /*forced_cut=*/0,
+            /*restore_source_slot=*/-1,
+            [](int cut) { return (size_t) cut; });
+        TEST_ASSERT(r.active());
+        TEST_ASSERT(r.target_cut() == 3);
+        r.cancel();
+    }
+
+    unlink(path.c_str());
+}
+
 TEST_CASE(ServerUnitFixture, test_restore_invalidation_preserves_pending_pin) {
     const std::string path = write_deepseek_marker_tokenizer_fixture();
     Tokenizer tokenizer;
